@@ -337,9 +337,10 @@ static void uvWriterCleanUpAndFireCloseCb(struct UvWriter *w)
     RaftHeapFree(w->events);
     UvOsIoDestroy(w->ctx);
 
-    if (w->close_cb != NULL) {
-        w->close_cb(w);
-    }
+// modification: don't call the callback after closing since it's called before, without waiting for closing.
+//    if (w->close_cb != NULL) {
+//        w->close_cb(w);
+//    }
 }
 
 static void uvWriterPollerCloseCb(struct uv_handle_s *handle)
@@ -407,6 +408,11 @@ void UvWriterClose(struct UvWriter *w, UvWriterCloseCb cb)
         uv_check_start(&w->check, uvWriterCheckCb);
     } else {
         uv_close((struct uv_handle_s *)&w->check, uvWriterCheckCloseCb);
+    }
+
+    // modification: call the callback directly and don't wait for the file to be closed.
+    if (w->close_cb != NULL) {
+        w->close_cb(w);
     }
 }
 
