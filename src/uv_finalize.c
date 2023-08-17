@@ -120,7 +120,7 @@ static int uvFinalizeStart(struct uvDyingSegment *segment)
     assert(segment->counter > 0);
 
     uv->finalize_work.data = segment;
-
+/*
     rv = uv_queue_work(uv->loop, &uv->finalize_work, uvFinalizeWorkCb,
                        uvFinalizeAfterWorkCb);
     if (rv != 0) {
@@ -128,6 +128,12 @@ static int uvFinalizeStart(struct uvDyingSegment *segment)
                      segment->counter, uv_strerror(rv));
         return RAFT_IOERR;
     }
+*/
+
+// Avoiding uv_queue_work seems to fix the latency problem, although it's not ideal to do it synchronously. Is this also a problem elsewhere?
+// A better way to fix this could be a reimplementation of uv_queue_work that calls an uv_async_t object to wake up the loop?
+    uvFinalizeWorkCb(&uv->finalize_work);
+    uvFinalizeAfterWorkCb(&uv->finalize_work, 0);
 
     return 0;
 }
