@@ -7,6 +7,8 @@
 #include "assert.h"
 #include "heap.h"
 
+double ms_elapsed(struct timespec* start);
+
 /* Copy the error message from the request object to the writer object. */
 static void uvWriterReqTransferErrMsg(struct UvWriterReq *req)
 {
@@ -329,6 +331,8 @@ err:
     return rv;
 }
 
+#define FB_MOD_DONT_WAIT_FOR_FILE_CLOSING //that seems to remove some time but the barrier seems to be independent of it...
+
 static void uvWriterCleanUpAndFireCloseCb(struct UvWriter *w)
 {
     assert(w->closing);
@@ -337,9 +341,12 @@ static void uvWriterCleanUpAndFireCloseCb(struct UvWriter *w)
     RaftHeapFree(w->events);
     UvOsIoDestroy(w->ctx);
 
+#ifndef FB_MOD_DONT_WAIT_FOR_FILE_CLOSING
+    //experiment: call the callback directly and don't wait for the file to be closed.
     if (w->close_cb != NULL) {
         w->close_cb(w);
     }
+#endif
 }
 
 static void uvWriterPollerCloseCb(struct uv_handle_s *handle)
@@ -375,8 +382,11 @@ static void uvWriterCheckCloseCb(struct uv_handle_s *handle)
     uvWriterCleanUpAndFireCloseCb(w);
 }
 
+struct timespec check_start_time;
+
 static void uvWriterCheckCb(struct uv_check_s *check)
 {
+    fprintf(stderr, "\033[103m\033[30m%s  called (uv_check_start() took %f ms) \033[0m\n", __FUNCTION__, ms_elapsed(&check_start_time));
     struct UvWriter *w = check->data;
     if (!QUEUE_IS_EMPTY(&w->work_queue)) {
         return;
@@ -386,6 +396,8 @@ static void uvWriterCheckCb(struct uv_check_s *check)
 
 void UvWriterClose(struct UvWriter *w, UvWriterCloseCb cb)
 {
+    struct timespec start_time;
+    clock_gettime(CLOCK_REALTIME, &start_time);
     int rv;
     assert(!w->closing);
     w->closing = true;
@@ -404,10 +416,18 @@ void UvWriterClose(struct UvWriter *w, UvWriterCloseCb cb)
     /* If we have requests executing in the threadpool, we need to wait for
      * them. That's done in the check callback. */
     if (!QUEUE_IS_EMPTY(&w->work_queue)) {
+        clock_gettime(CLOCK_REALTIME, &check_start_time);
         uv_check_start(&w->check, uvWriterCheckCb);
     } else {
         uv_close((struct uv_handle_s *)&w->check, uvWriterCheckCloseCb);
     }
+#ifdef FB_MOD_DONT_WAIT_FOR_FILE_CLOSING
+    //experiment: call the callback directly and don't wait for the file to be closed.
+    if (w->close_cb != NULL) {
+        w->close_cb(w);
+    }
+#endif
+    fprintf(stderr, "\033[103m\033[30m%s  took %f ms \033[0m\n", __FUNCTION__, ms_elapsed(&start_time) );
 }
 
 /* Return the total lengths of the given buffers. */

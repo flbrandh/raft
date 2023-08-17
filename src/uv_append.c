@@ -6,6 +6,9 @@
 #include "uv_encoding.h"
 #include "uv_writer.h"
 
+double ms_difference(struct timespec* start, struct timespec* end);
+double ms_elapsed(struct timespec* start);
+
 #define tracef(...) Tracef(uv->tracer, __VA_ARGS__)
 
 /* The happy path for an append request is:
@@ -71,8 +74,10 @@ struct uvAppend
     queue queue;
 };
 
+struct timespec close_start_time;
 static void uvAliveSegmentWriterCloseCb(struct UvWriter *writer)
 {
+    fprintf(stderr, "\033[103m\033[30m%s called | UvWriterClose took %f ms \033[0m\n", __FUNCTION__, ms_elapsed(&close_start_time) );
     struct uvAliveSegment *segment = writer->data;
     struct uv *uv = segment->uv;
     uvSegmentBufferClose(&segment->pending);
@@ -83,6 +88,9 @@ static void uvAliveSegmentWriterCloseCb(struct UvWriter *writer)
 /* Submit a request to close the current open segment. */
 static void uvAliveSegmentFinalize(struct uvAliveSegment *s)
 {
+    fprintf(stderr, "\033[45;1m%s called \033[0m\n", __FUNCTION__ ); // could this be the culprit? Would there be no blocking if snapshots are made once segments are full?
+    struct timespec start_time;
+    clock_gettime(CLOCK_REALTIME, &start_time);
     struct uv *uv = s->uv;
     int rv;
 
@@ -94,7 +102,11 @@ static void uvAliveSegmentFinalize(struct uvAliveSegment *s)
     }
 
     QUEUE_REMOVE(&s->queue);
+
+    clock_gettime(CLOCK_REALTIME, &close_start_time);
     UvWriterClose(&s->writer, uvAliveSegmentWriterCloseCb);
+    fprintf(stderr,"\033[41;1mexecuting sql-operation took %f ms to execute\033[0m\n",
+            ms_elapsed(&start_time));
 }
 
 /* Flush the append requests in the given queue, firing their callbacks with the
@@ -296,6 +308,10 @@ static int uvAliveSegmentWrite(struct uvAliveSegment *s)
     assert(s->counter != 0);
     assert(s->pending.n > 0);
     uvSegmentBufferFinalize(&s->pending, &s->buf);
+    //experiment: double free or corruption
+//    struct UvWriterReq req;
+//    req.data = s;
+//    uvAliveSegmentWriteCb(&req, 0);
     rv = UvWriterSubmit(&s->writer, &s->write, &s->buf, 1,
                         s->next_block * s->uv->block_size,
                         uvAliveSegmentWriteCb);
@@ -711,6 +727,9 @@ err:
  * requests get completed. */
 static void uvFinalizeCurrentAliveSegmentOnceIdle(struct uv *uv)
 {
+    struct timespec start_time;
+    clock_gettime(CLOCK_REALTIME, &start_time);
+    fprintf(stderr, "\033[45;1m%s called \033[0m\n", __FUNCTION__ ); // could this be the culprit? Would there be no blocking if snapshots are made once segments are full?
     struct uvAliveSegment *s;
     queue *head;
     bool has_pending_reqs;
@@ -744,6 +763,9 @@ static void uvFinalizeCurrentAliveSegmentOnceIdle(struct uv *uv)
     } else {
         s->finalize = true;
     }
+
+    fprintf(stderr,"\033[41;1mexecuting sql-operation took %f ms to execute\033[0m\n",
+            ms_elapsed(&start_time));
 }
 
 bool UvBarrierReady(struct uv *uv)
@@ -766,6 +788,7 @@ bool UvBarrierReady(struct uv *uv)
 bool UvBarrierMaybeTrigger(struct UvBarrier *barrier)
 {
     if (!barrier) {
+        fprintf(stderr, "\033[45;1m%s: no barrier\033[0m\n", __FUNCTION__ );
         return false;
     }
 
@@ -775,17 +798,20 @@ bool UvBarrierMaybeTrigger(struct UvBarrier *barrier)
         head = QUEUE_HEAD(&barrier->reqs);
         QUEUE_REMOVE(head);
         r = QUEUE_DATA(head, struct UvBarrierReq, queue);
+        fprintf(stderr, "\033[45;1m%s: calling UVBarrierReq callback\033[0m\n", __FUNCTION__);
         r->cb(r);
         return true;
     }
-
+    fprintf(stderr, "\033[45;1m%s: open barrier requests; not calling the barrier request callback.\033[0m\n", __FUNCTION__ );
     return false;
 }
 
 /* Used during cleanup. */
 static void uvBarrierTriggerAll(struct UvBarrier *barrier)
 {
+    fprintf(stderr, "\033[45;1m%s: calling UvBarrierMaybeTrigger.\033[0m\n", __FUNCTION__ );
     while (UvBarrierMaybeTrigger(barrier)) {
+        fprintf(stderr, "\033[45;1m%s: calling UvBarrierMaybeTrigger again.\033[0m\n", __FUNCTION__ );
         ;
     }
 }
@@ -801,8 +827,15 @@ struct UvBarrier *uvBarrierAlloc(void)
     return barrier;
 }
 
+/**
+ * FB-Comment: This function seems to add the barrier request, containing the callback to the segments in question to be called after all pending operations are written to disk. But where are the callbacks called?
+ * Is there a background thread for writing pending operations to disk that triggers the callback?
+ */
 int UvBarrier(struct uv *uv, raft_index next_index, struct UvBarrierReq *req)
 {
+    fprintf(stderr, "\033[45;1m%s: called\033[0m\n", __FUNCTION__);
+    struct timespec start_time;
+    clock_gettime(CLOCK_REALTIME, &start_time);
     /* The barrier to attach to. */
     struct UvBarrier *barrier = NULL;
     struct uvAliveSegment *segment = NULL;
@@ -835,6 +868,7 @@ int UvBarrier(struct uv *uv, raft_index next_index, struct UvBarrierReq *req)
             }
             /* And add the request to the barrier. */
             UvBarrierAddReq(barrier, req);
+            fprintf(stderr, "\033[45;1m%s: added request to a new segment barrier\033[0m\n", __FUNCTION__);
         }
         segment->barrier = barrier;
 
@@ -844,10 +878,14 @@ int UvBarrier(struct uv *uv, raft_index next_index, struct UvBarrierReq *req)
         }
         segment->finalize = true;
     }
+    fprintf(stderr, "\033[45;1m%s: after queues\033[0m\n", __FUNCTION__);
+    struct timespec start_time_after_queues;
+    clock_gettime(CLOCK_REALTIME, &start_time_after_queues);
 
     /* Unable to attach to a segment, because all segments are involved in a
      * barrier, or there are no segments. */
     if (barrier == NULL) {
+        fprintf(stderr, "\033[45;1m%s: no barrier yet\033[0m\n", __FUNCTION__);
         /* Attach req to last segment barrier. */
         if (segment != NULL) {
             barrier = segment->barrier;
@@ -862,6 +900,7 @@ int UvBarrier(struct uv *uv, raft_index next_index, struct UvBarrierReq *req)
             }
         }
         UvBarrierAddReq(barrier, req);
+        fprintf(stderr, "\033[45;1m%s: added request to another? barrier\033[0m\n", __FUNCTION__);
     }
 
     /* Let's not continue writing new entries if something down the line
@@ -881,21 +920,25 @@ int UvBarrier(struct uv *uv, raft_index next_index, struct UvBarrierReq *req)
             QUEUE_IS_EMPTY(&uv->finalize_reqs) &&
             uv->finalize_work.data == NULL) {
             /* Not interested in return value. */
+            fprintf(stderr, "\033[45;1m%s: no open segments -> immediately call UvBarrierMaybeTrigger \033[0m\n", __FUNCTION__);
             UvBarrierMaybeTrigger(barrier);
         }
     }
-
+    fprintf(stderr, "\033[45;1m%s: took %fms (ater queues: %f)\033[0m\n", __FUNCTION__,  ms_elapsed(&start_time), ms_elapsed(&start_time_after_queues) );
     return 0;
 }
 
 void UvUnblock(struct uv *uv)
 {
+    fprintf(stderr, "\033[45;1m%s: called; now calling UvBarrierMaybeTrigger(uv->barrier)\033[0m\n", __FUNCTION__);
     /* First fire all pending barrier requests. Unblock will be called again
      * when that request's callback is fired.  */
+    fprintf(stderr, "\033[45;1m%s: triggering barrier request callback\033[0m\n", __FUNCTION__);
     if (UvBarrierMaybeTrigger(uv->barrier)) {
         tracef("UvUnblock triggered barrier request callback.");
         return;
     }
+        fprintf(stderr, "\033[45;1m%s: barrier queue is empty\033[0m\n", __FUNCTION__);
 
     /* All requests in barrier are finished. */
     tracef("UvUnblock queue empty");
@@ -916,6 +959,7 @@ void UvUnblock(struct uv *uv)
 
 void UvBarrierAddReq(struct UvBarrier *barrier, struct UvBarrierReq *req)
 {
+    fprintf(stderr, "\033[45;1m%s called \033[0m\n", __FUNCTION__ );
     assert(barrier != NULL);
     assert(req != NULL);
     /* Once there's a blocking req, this barrier becomes blocking. */

@@ -19,12 +19,19 @@ struct uvDyingSegment
     queue queue;            /* Link to finalize queue */
 };
 
+double ms_elapsed(struct timespec* start);
+struct timespec finalize_start, finalize_work_cb_end;
+
+
 /* Run all blocking syscalls involved in closing a used open segment.
  *
  * An open segment is closed by truncating its length to the number of bytes
  * that were actually written into it and then renaming it. */
 static void uvFinalizeWorkCb(uv_work_t *work)
 {
+    struct timespec start;
+    clock_gettime(CLOCK_REALTIME, &start);
+
     struct uvDyingSegment *segment = work->data;
     struct uv *uv = segment->uv;
     char filename1[UV__FILENAME_LEN];
@@ -62,17 +69,26 @@ sync:
     }
 
     segment->status = 0;
+
+    fprintf(stderr,"\033[102m\033[30m%s took %fms \033[0m\n",
+            __FUNCTION__, ms_elapsed(&start));
+    clock_gettime(CLOCK_REALTIME, &finalize_work_cb_end);
     return;
 
 err:
     tracef("truncate segment %s: %s", filename1, errmsg);
     assert(rv != 0);
     segment->status = rv;
+    clock_gettime(CLOCK_REALTIME, &finalize_work_cb_end);
 }
+
+
 
 static int uvFinalizeStart(struct uvDyingSegment *segment);
 static void uvFinalizeAfterWorkCb(uv_work_t *work, int status)
 {
+    fprintf(stderr,"\033[42;1mfinalizing segment took %f ms to execute (%fms to call %s)\033[0m\n",
+            ms_elapsed(&finalize_start), ms_elapsed(&finalize_work_cb_end), __FUNCTION__);
     struct uvDyingSegment *segment = work->data;
     struct uv *uv = segment->uv;
     tracef("uv finalize after work segment %p cb status:%d", (void *)segment,
@@ -92,6 +108,7 @@ static void uvFinalizeAfterWorkCb(uv_work_t *work, int status)
     if (QUEUE_IS_EMPTY(&uv->finalize_reqs)) {
         tracef("unblock barrier or close");
         if (uv->barrier != NULL && UvBarrierReady(uv)) {
+            printf(stderr, "\033[45;1m%s: called UvBarrierMaybeTrigger\033[0m\n", __FUNCTION__);
             UvBarrierMaybeTrigger(uv->barrier);
         }
         uvMaybeFireCloseCb(uv);
@@ -121,8 +138,17 @@ static int uvFinalizeStart(struct uvDyingSegment *segment)
 
     uv->finalize_work.data = segment;
 
-    rv = uv_queue_work(uv->loop, &uv->finalize_work, uvFinalizeWorkCb,
-                       uvFinalizeAfterWorkCb);
+    clock_gettime(CLOCK_REALTIME, &finalize_start);
+
+//    rv = uv_queue_work(uv->loop, &uv->finalize_work, uvFinalizeWorkCb,
+//                       uvFinalizeAfterWorkCb);
+
+// Avoiding uv_queue_work seems to fix the latency problem, although it's not ideal to do it synchronously. Is this also a problem elsewhere?
+// A better way to fix this could be a reimplementation of uv_queue_work that calls an uv_async_t object to wake up the loop?
+    uvFinalizeWorkCb(&uv->finalize_work);
+    uvFinalizeAfterWorkCb(&uv->finalize_work, 0);
+    rv = 0;
+
     if (rv != 0) {
         ErrMsgPrintf(uv->io->errmsg, "start to truncate segment file %llu: %s",
                      segment->counter, uv_strerror(rv));

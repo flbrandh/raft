@@ -11,6 +11,10 @@
 #include "uv_encoding.h"
 #include "uv_os.h"
 
+#include <time.h>
+double ms_difference(struct timespec* start, struct timespec* end);
+double ms_elapsed(struct timespec* start);
+
 #define tracef(...) Tracef(uv->tracer, __VA_ARGS__)
 
 /* Arbitrary maximum configuration size. Should be practically be enough */
@@ -499,8 +503,16 @@ static int makeFileCompressed(const char *dir,
     return rv;
 }
 
+struct timespec time_end_uvSnapshotPutWorkCb;
+
+/**
+ * Actually writes the snapshot file (and is called in a separate thread)
+ * @param work
+ */
 static void uvSnapshotPutWorkCb(uv_work_t *work)
 {
+    struct timespec time_start_snapshot_put_work_cb;
+    clock_gettime(CLOCK_REALTIME, &time_start_snapshot_put_work_cb);
     struct uvSnapshotPut *put = work->data;
     struct uv *uv = put->uv;
     char metadata[UV__FILENAME_LEN];
@@ -556,6 +568,11 @@ static void uvSnapshotPutWorkCb(uv_work_t *work)
 
     put->status = 0;
 
+    fprintf(stderr,"\033[45;1m%s took %f ms to execute \033[0m\n",
+           __PRETTY_FUNCTION__,
+           ms_elapsed(&time_start_snapshot_put_work_cb));
+
+    clock_gettime(CLOCK_REALTIME, &time_end_uvSnapshotPutWorkCb);
     return;
 }
 
@@ -574,6 +591,8 @@ static void uvSnapshotPutFinish(struct uvSnapshotPut *put)
 
 static void uvSnapshotPutAfterWorkCb(uv_work_t *work, int status)
 {
+    fprintf(stderr,"\033[45;1muv_queue_work waited %f ms to call%s \033[0m\n",
+            ms_elapsed(&time_end_uvSnapshotPutWorkCb), __PRETTY_FUNCTION__);
     struct uvSnapshotPut *put = work->data;
     struct uv *uv = put->uv;
     assert(status == 0);
@@ -594,6 +613,8 @@ static void uvSnapshotPutStart(struct uvSnapshotPut *put)
     }
 
     uv->snapshot_put_work.data = put;
+//    uvSnapshotPutWorkCb(&uv->snapshot_put_work);
+//    uvSnapshotPutAfterWorkCb(&uv->snapshot_put_work, 0);
     rv = uv_queue_work(uv->loop, &uv->snapshot_put_work, uvSnapshotPutWorkCb,
                        uvSnapshotPutAfterWorkCb);
     if (rv != 0) {
@@ -603,8 +624,12 @@ static void uvSnapshotPutStart(struct uvSnapshotPut *put)
     }
 }
 
+struct timespec start_uv_snapshot_put_barrier;
+
 static void uvSnapshotPutBarrierCb(struct UvBarrierReq *barrier)
 {
+    fprintf(stderr,"\033[103m\033[30muv snapshot barrier took %f ms to call %s \033[0m\n",
+            ms_elapsed(&start_uv_snapshot_put_barrier), __FUNCTION__ );
     /* Ensure that we don't invoke this callback more than once. */
     barrier->cb = NULL;
     struct uvSnapshotPut *put = barrier->data;
@@ -624,12 +649,15 @@ static void uvSnapshotPutBarrierCb(struct UvBarrierReq *barrier)
     uvSnapshotPutStart(put);
 }
 
+
 int UvSnapshotPut(struct raft_io *io,
                   unsigned trailing,
                   struct raft_io_snapshot_put *req,
                   const struct raft_snapshot *snapshot,
                   raft_io_snapshot_put_cb cb)
 {
+    struct timespec time_start_snapshot_put;
+    clock_gettime(CLOCK_REALTIME, &time_start_snapshot_put);
     struct uv *uv;
     struct uvSnapshotPut *put;
     void *cursor;
@@ -645,6 +673,7 @@ int UvSnapshotPut(struct raft_io *io,
     assert(uv->snapshot_put_work.data == NULL);
 
     tracef("put snapshot at %lld, keeping %d", snapshot->index, trailing);
+    fprintf(stderr,"\033[45;1mput snapshot at %lld, keeping %d\033[0m\n", snapshot->index, trailing);
 
     put = RaftHeapMalloc(sizeof *put);
     if (put == NULL) {
@@ -692,10 +721,17 @@ int UvSnapshotPut(struct raft_io *io,
      * and we don't change append_next_index. */
     next_index =
         (trailing == 0) ? (snapshot->index + 1) : uv->append_next_index;
+    clock_gettime(CLOCK_REALTIME, &start_uv_snapshot_put_barrier);
+    fprintf(stderr,"\033[45;1m%s calling UvBarrier\033[0m\n");
     rv = UvBarrier(uv, next_index, &put->barrier);
     if (rv != 0) {
         goto err_after_configuration_encode;
     }
+
+    fprintf(stderr,"\033[45;1m%s took %f ms to execute \033[0m\n",
+           __PRETTY_FUNCTION__,
+           ms_elapsed(&time_start_snapshot_put));
+
 
     return 0;
 

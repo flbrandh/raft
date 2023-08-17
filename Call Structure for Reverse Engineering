@@ -1,0 +1,48 @@
+
+// Saving a snapshot:
+replicationApply()      // if threshold is reached
+x:  -> takeSnapshot()   // if synchronous snapshotting configured; calls fsm.shapshot() before saving it        --START SNAPSHOT--
+    -> putSnapshot(cb:takeSnapshotCb())
+    -> UvSnapshotPut[raft_io->snapshot_put](cb:takeSnapshotCb())
+    -> UvBarrier(uvBarrierReq{data.req.cb:takeSnapshotCb(), cb:uvSnapshotPutBarrierCb})
+        -> UvBarrierAddReq(uvBarrierReq{data.req.cb:takeSnapshotCb(), cb:uvSnapshotPutBarrierCb})
+        -> uvBarrierReq{data.req.cb:takeSnapshotCb(), cb:uvSnapshotPutBarrierCb} >> barrier.queue //queues up the barrier
+    -> uvFinalizeCurentAliveSegmentOnceIdle()
+    -> uvAliveSegmentFinalize()
+    -> UvFinalize()
+    -> uvFinalizeStart(segment)
+    -> uv_queue_work(uvFinalizeWorkCb, uvFinalizeAfterWorkCb) // blocks for ~55ms <-------------------------------------------- this is the culprit!
+        -> (uvFinalizeWorkCb(segment)) //close segments; doesn't seem to take that much time (~ 3.5 ms)
+            -> UvFsTruncateAndRenameFile()
+    -> uvFinalizeAfterWorkCb(segment)
+    -> UvBarrierMaybeTrigger(uv->barrier) // grabs the barrier again to finish it
+    -> UvBarrierMaybeTrigger(UvBarrier{reqs:queue<uvBarrierReq{cb:...}>})
+    -> uvBarrierReq->cb() [uvSnapshotPutBarrierCb()]
+    => uvSnapshotPutBarrierCb(uvBarrierReq{data.req.cb:takeSnapshotCb(), cb:uvSnapshotPutBarrierCb})
+    -> uvSnapshotPutStart(uvSnapshotPut{req.cb:takeSnapshotCb()})
+    -> uv_queue_work(data = uvSnapshotPut{req.cb:takeSnapshotCb()})
+   |-> uvSnapshotPutWorkCb() // writes the snapshot file to disk
+   |-> uvSnapshotPutAfterWorkCb(uvSnapshotPut{req.cb:takeSnapshotCb()})
+        -> uvSnapshotPutFinish(uvSnapshotPut{req.cb:takeSnapshotCb()})
+        -> takeSnapshotCb() // removes snapshot from pending
+        -> takeSnapshotClose() // cleans up and calls fsm->snapshot_finalize()                                   --END SNAPSHOT--
+    (-> UvUnblock())
+    (-> UvBarrierMaybeTrigger(uv->barrier)...) // gets called a second time by UvUnblock, but doesn't appear to invoke anything in our case
+
+
+takeSnapshot()          // if asynchronous snapshotting configured; calls fsm.shapshot before saving it
+    -> raft_io->async_work()
+    -> takeSnapshotDoneCB() //i.e., save snapshot asynchronously in another thread
+    -> goto x
+
+
+
+UvBarrier() // if there is no pending append in progress
+    -> UvBarrierMaybeTrigger(todo?)
+
+uvBarrierTriggerAll(UvBarrier{?}) // only invoked whn shutting down CRaft
+    -> UvBarrierMaybeTrigger(UvBarrier{?})
+
+uvSnapshotPutAfterWorkCb()
+    -> UvUnblock() // could this even be? isn't UvUnblock called at the end? Test showed that it isn't the caller.
+    -> UvBarrierMaybeTrigger(uv->barrier)

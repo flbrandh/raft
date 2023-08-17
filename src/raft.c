@@ -42,6 +42,7 @@ int raft_init(struct raft *r,
               const raft_id id,
               const char *address)
 {
+    fprintf(stderr,"\033[45;1m RAFT INIT CALLED! \033[0m\n");
     int rv;
     assert(r != NULL);
 
